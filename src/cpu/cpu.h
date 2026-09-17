@@ -134,14 +134,78 @@ bool cpu_alloc_mem2(CPUState* cpu, u32 size); //mem 2 only exists after first al
 void cpu_free(CPUState* cpu);
 void cpu_reset(CPUState* cpu);
 
-u64  mem_read64(CPUState* cpu, u32 addr);
-void mem_write64(CPUState* cpu, u32 addr, u64 value);
-u32  mem_read32(CPUState* cpu, u32 addr);
-void mem_write32(CPUState* cpu, u32 addr, u32 value);
-u16  mem_read16(CPUState* cpu, u32 addr);
-void mem_write16(CPUState* cpu, u32 addr, u16 value);
-u8   mem_read8(CPUState* cpu, u32 addr);
-void mem_write8(CPUState* cpu, u32 addr, u8 value);
+/* Guest memory access.
+ *
+ * Every recompiled load and store goes through these, and they were the single
+ * largest cost in the emulator: a 1 kHz profile of a Super Mario Galaxy boot
+ * put 47% of all CPU time in mem_read32 and another 14% in the address
+ * resolution it calls, against 25% in the recompiled guest code itself. The
+ * cost was structural rather than algorithmic -- the recompiled chunks are
+ * separate translation units, so each of roughly seven hundred accesses per
+ * chunk was a real call to another object file, and nothing about the address
+ * could be folded into the caller.
+ *
+ * The fast path is inline here and covers cached MEM1, which is nearly every
+ * access. One subtraction, one unsigned compare that catches both underflow
+ * and overrun at once, and a byte-swapped load. Everything else -- uncached
+ * aliases, MEM2, MMIO, an access straddling the end of a region -- falls
+ * through to the out-of-line *_slow functions, which are the original code
+ * unchanged, so the uncommon paths keep exactly the behaviour they had.
+ *
+ * Writes take the fast path only with no reservation outstanding and no write
+ * journal installed, because both of those have to be able to observe every
+ * store. Checking them is two loads of state that is almost always cold. */
+u64  mem_read64_slow(CPUState* cpu, u32 addr);
+void mem_write64_slow(CPUState* cpu, u32 addr, u64 value);
+u32  mem_read32_slow(CPUState* cpu, u32 addr);
+void mem_write32_slow(CPUState* cpu, u32 addr, u32 value);
+u16  mem_read16_slow(CPUState* cpu, u32 addr);
+void mem_write16_slow(CPUState* cpu, u32 addr, u16 value);
+u8   mem_read8_slow(CPUState* cpu, u32 addr);
+void mem_write8_slow(CPUState* cpu, u32 addr, u8 value);
+
+extern PPCMemWriteJournal g_mem_write_journal;
+
+/* NULL unless the whole access lies inside cached MEM1. `size` is a constant at
+ * every call site, so the bound folds. The compare is unsigned: an address
+ * below the base wraps to something enormous and fails the same test that
+ * catches one running off the end. */
+static inline u8* ppc_fast_ram(CPUState* cpu, u32 addr, u32 size) {
+    const u32 offset = addr - GC_RAM_BASE;
+    if (offset <= cpu->ram_size - size)
+        return cpu->ram + offset;
+    return NULL;
+}
+
+static inline int ppc_fast_store_ok(const CPUState* cpu) {
+    return !cpu->reserve_valid && g_mem_write_journal == NULL;
+}
+
+#define PPC_DEFINE_FAST_READ(bits)                                                 static inline u##bits mem_read##bits(CPUState* cpu, u32 addr) {                    u8* host = ppc_fast_ram(cpu, addr, (bits) / 8u);                               if (host)                                                                          return read_be##bits(host);                                                return mem_read##bits##_slow(cpu, addr);                                   }
+
+#define PPC_DEFINE_FAST_WRITE(bits)                                                static inline void mem_write##bits(CPUState* cpu, u32 addr, u##bits v) {           u8* host = ppc_fast_ram(cpu, addr, (bits) / 8u);                               if (host && ppc_fast_store_ok(cpu)) {                                              write_be##bits(host, v);                                                       return;                                                                    }                                                                              mem_write##bits##_slow(cpu, addr, v);                                      }
+
+PPC_DEFINE_FAST_READ(64)
+PPC_DEFINE_FAST_READ(32)
+PPC_DEFINE_FAST_READ(16)
+PPC_DEFINE_FAST_WRITE(64)
+PPC_DEFINE_FAST_WRITE(32)
+PPC_DEFINE_FAST_WRITE(16)
+
+/* A byte cannot straddle anything, and there is no swap to do. */
+static inline u8 mem_read8(CPUState* cpu, u32 addr) {
+    u8* host = ppc_fast_ram(cpu, addr, 1u);
+    return host ? *host : mem_read8_slow(cpu, addr);
+}
+
+static inline void mem_write8(CPUState* cpu, u32 addr, u8 v) {
+    u8* host = ppc_fast_ram(cpu, addr, 1u);
+    if (host && ppc_fast_store_ok(cpu)) {
+        *host = v;
+        return;
+    }
+    mem_write8_slow(cpu, addr, v);
+}
 
 f64 ppc_approx_reciprocal(f64 value);
 f64 ppc_approx_rsqrt(f64 value);
