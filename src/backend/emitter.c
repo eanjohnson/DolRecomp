@@ -1607,9 +1607,27 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
         fprintf(out, "    }\n");
         break;
 
+    /* Data cache maintenance. There is no emulated data cache and guest memory
+     * is coherent, so these do nothing -- which is already what happened: they
+     * reached the fallback, matched none of its cases, and fell out of its tail
+     * with pc = cia + 4. Inlining the no-op changes no semantics and removes a
+     * dispatcher round-trip per 32-byte cache line.
+     *
+     * That round-trip is the whole cost. DCInvalidateRange and DCFlushRange are
+     * three-instruction bdnz loops whose branch already has a goto fast path,
+     * but the `return` on the dcbi/dcbf line meant the loop could never use it
+     * and exited to the dispatcher every iteration. Together they were 56% of
+     * all dispatch blocks in an SMG boot (1.77M + 1.02M of 5M).
+     *
+     * ICBI stays on the fallback: instruction cache invalidation is how
+     * self-modifying code announces itself, and that is a real signal to keep
+     * even while it is currently unhandled. */
     case PPC_OP_DCBST:
     case PPC_OP_DCBF:
     case PPC_OP_DCBI:
+        fprintf(out, "    (void)ctx;\n");
+        break;
+
     case PPC_OP_ICBI:
         fprintf(out, "    ppc_fallback_instruction(ctx, 0x%08Xu, 0x%08Xu);\n",
                 inst->raw, inst->address);
